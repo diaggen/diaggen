@@ -1,0 +1,5 @@
+genesis_diagnostics:
+  enable: false
+  genesis_root: ../third_party/genesis-world
+  genesis_env_path: ../third_party/genesis-world/.conda/genesis_world-main
+  genesis_live_command: python -m genesis.live.server

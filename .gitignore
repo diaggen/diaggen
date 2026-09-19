@@ -1,0 +1,14 @@
+outputs/
+.conda/
+.venv/
+venv/
+third_party/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+.env
+.env.*
+*.pem
+*.key
+*.log

@@ -1,0 +1,32 @@
+# DiagGen project-owned runtime dependencies (Python 3.12).
+# Install in the appropriate runtime/mesh environment; no environments are bundled.
+numpy==2.3.5
+scipy==1.17.1
+Pillow==12.2.0
+PyYAML==6.0.3
+mcp==1.27.1
+opencv-python==4.13.0.92
+pyvista==0.47.0
+vtk==9.6.0
+trimesh==4.11.5
+libigl==2.6.2
+pymeshlab==2025.7
+pytetwild==0.2.3
+manifold3d==3.4.1
+meshio
+
+# External source dependencies, intentionally not vendored or installed by this file:
+# - SAM3: source checkout at third_party/sam3, installed in hag4r_segmentation.
+#   Import: sam3; its own dependency constraints require a separate environment.
+# - OmniPart: source checkout at third_party/OmniPart, environment omnipart.
+#   Required CLI: scripts.inference_omnipart --segmentation_manifest --output_root.
+#   Must emit the Step 16 and appearance artifact contracts consumed by this runtime.
+#   Required checkpoints: ckpt/partfield_encoder.ckpt and ckpt/bbox_gen.ckpt.
+# - Genesis: external backend configured in configs/config_genesis_diagnostics_enabled.yaml.
+#   Required CLI: python -m genesis.live.server, with the live diagnostics API.
+#   The simulator implementation and its environment are not part of this repository.
+# - torch, nvdiffrast, xatlas==0.0.9: required in the OmniPart rendering environment.
+#   Install builds compatible with that environment's CUDA/PyTorch stack.
+# - ffmpeg: executable on PATH for diagnostic videos (system or environment package).
+# - conda: executable on PATH for the existing stage environment launchers.
+# This is a source release, not a lockfile for the external model/simulator environments.

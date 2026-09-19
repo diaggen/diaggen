@@ -1,0 +1,13 @@
+[agents]
+max_depth = 2
+
+[features]
+multi_agent_v2 = true
+
+[mcp_servers.hag4r_genesis_diagnostics]
+command = "sh"
+args = ["-c", 'cd "${DIAGGEN_ROOT:?Set DIAGGEN_ROOT to this checkout}" && exec ./.conda/hag4r/bin/python -B -m hag4r.agentic.diagnostic_mcp_server --owner-lease-timeout-s 3900']
+env_vars = ["DIAGGEN_ROOT"]
+env = { CUDA_VISIBLE_DEVICES = "0" }
+startup_timeout_sec = 30
+tool_timeout_sec = 3900
