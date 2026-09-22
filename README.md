@@ -3,6 +3,7 @@
 ### Agentic Generation of Deformable Assets with Sim-based Diagnostics for Robotic Simulation
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2609.23103"><img src="https://img.shields.io/badge/arXiv-2609.23103-b31b1b?style=for-the-badge&amp;logo=arxiv&amp;logoColor=white" alt="arXiv:2609.23103"></a>
   <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&amp;logo=python&amp;logoColor=white" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Genesis-1.2.0-5546A6?style=for-the-badge" alt="Genesis 1.2.0">
   <img src="https://img.shields.io/badge/SAM-3-0467DF?style=for-the-badge&amp;logo=meta&amp;logoColor=white" alt="SAM3">
