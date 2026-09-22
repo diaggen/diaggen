@@ -16,15 +16,16 @@ manifold3d==3.4.1
 meshio
 
 # External source dependencies, intentionally not vendored or installed by this file:
-# - SAM3: source checkout at third_party/sam3, installed in hag4r_segmentation.
+# - SAM3: source is bundled at third_party/sam3, installed in hag4r_segmentation.
 #   Import: sam3; its own dependency constraints require a separate environment.
-# - OmniPart: source checkout at third_party/OmniPart, environment omnipart.
+# - OmniPart: source is bundled at third_party/OmniPart, environment omnipart.
 #   Required CLI: scripts.inference_omnipart --segmentation_manifest --output_root.
 #   Must emit the Step 16 and appearance artifact contracts consumed by this runtime.
 #   Required checkpoints: ckpt/partfield_encoder.ckpt and ckpt/bbox_gen.ckpt.
-# - Genesis: external backend configured in configs/config_genesis_diagnostics_enabled.yaml.
+# - Genesis: source is bundled at third_party/genesis-world; its environment is external
+#   and configured in configs/config_genesis_diagnostics_enabled.yaml.
 #   Required CLI: python -m genesis.live.server, with the live diagnostics API.
-#   The simulator implementation and its environment are not part of this repository.
+#   The simulator's Conda environment is not part of this repository.
 # - torch, nvdiffrast, xatlas==0.0.9: required in the OmniPart rendering environment.
 #   Install builds compatible with that environment's CUDA/PyTorch stack.
 # - ffmpeg: executable on PATH for diagnostic videos (system or environment package).

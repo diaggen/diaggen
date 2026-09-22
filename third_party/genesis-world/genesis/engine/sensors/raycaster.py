@@ -1,0 +1,443 @@
+import math
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, NamedTuple
+
+import numpy as np
+import torch
+
+import genesis as gs
+from genesis.engine.bvh import AABB, LBVH
+from genesis.engine.solvers.base_solver import StateChange, Subscriber
+from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
+from genesis.options.sensors import Raycaster as RaycasterOptions
+from genesis.options.sensors import RaycastPattern
+from genesis.utils.geom import transform_by_quat, transform_by_trans_quat
+from genesis.utils.misc import concat_with_tensor, make_tensor_field, qd_to_numpy, qd_to_torch
+from genesis.utils.raycast_qd import (
+    kernel_cast_rays,
+    kernel_cast_rays_visual,
+    kernel_update_visual_aabbs,
+    kernel_update_verts_and_aabbs,
+)
+from genesis.vis.rasterizer_context import RasterizerContext
+
+from .base_sensor import (
+    KinematicSensorMetadataMixin,
+    KinematicSensorMixin,
+    SharedSensorContext,
+    SimpleSensorMetadata,
+    SimpleSensor,
+)
+
+if TYPE_CHECKING:
+    from genesis.engine.solvers.kinematic_solver import KinematicSolver
+    from genesis.ext.pyrender.mesh import Mesh
+    from genesis.utils.ring_buffer import TensorRingBuffer
+
+    from .sensor_manager import SensorManager
+
+
+@dataclass
+class BVHContext:
+    """A solver's raycast BVH and the bookkeeping for rebuilding and casting it."""
+
+    solver: "KinematicSolver"
+    bvh: LBVH
+    aabb: AABB
+    # None for a collision BVH (faces_info / verts_info, no per-face mask), else an int8 (n_vfaces,) array selecting
+    # which visual faces contribute.
+    raycast_mask: np.ndarray | None = None
+
+    # True when no link in the solver can be moved by the physics (all links fixed), so its geometry only ever changes
+    # through an explicit set_pos/set_quat (collision) or set_vverts (visual) - all GEOMETRY mutations the subscription
+    # catches. Such an entry skips the per-step rebuild - the dominant cost for static raycasting - and rebuilds only
+    # when flagged.
+    maybe_static: bool = False
+    # Lazy GEOMETRY subscriber for a static entry, registered on its solver; None for a movable entry (which rebuilds
+    # every step regardless). RaycastContext.update polls it: a pending set_pos/set_quat/set_vverts flags for rebuild.
+    rebuild_subscriber: Subscriber | None = None
+    # Set whenever this entry must rebuild before the next cast: at init, on reset, and when its rebuild_subscriber
+    # reveals a set_pos/set_quat/set_vverts since the last build. Ignored by non-static entries, which rebuild every
+    # step regardless.
+    needs_rebuild: bool = True
+    # True when the geometry is bit-identical across envs, so the cast reads one shared copy (batch 0) with coalesced
+    # node loads instead of scattering over n_env identical trees. Recomputed on every rebuild.
+    shared_across_envs: bool = False
+
+
+class RaycastContext(SharedSensorContext):
+    """
+    Per-simulator collision/visual raycast BVHs, shared across sensor types that cast rays.
+
+    Holds one ``BVHContext`` per (active solver, mesh type): a collision BVH over a rigid solver's faces and a visual
+    BVH over the vfaces opted into ``material.use_visual_raycasting``.
+    """
+
+    def __init__(self, sim):
+        super().__init__(sim)
+        self._bvh_contexts: list[BVHContext] = []
+
+    @property
+    def bvh_contexts(self) -> list[BVHContext]:
+        """The per-(solver, mesh-type) BVHs. Raises if inactive: only a consumer that activated it may read them."""
+        if not self._active:
+            raise gs.GenesisException("RaycastContext queried before activation; no sensor declared a raycast need.")
+        return self._bvh_contexts
+
+    @staticmethod
+    def _compute_visual_raycast_mask(solver: "KinematicSolver") -> np.ndarray:
+        """Build a per-vface mask (int8, shape (n_vfaces,)) selecting vfaces opted into visual raycasting.
+        A vface is opted in iff its owning vgeom belongs to an entity whose material has use_visual_raycasting=True.
+        """
+        n_vfaces = solver.vfaces_info.vgeom_idx.shape[0]
+        if n_vfaces == 0:
+            return np.zeros(0, dtype=np.int8)
+        vgeom_enabled = np.zeros(solver.n_vgeoms, dtype=np.bool_)
+        for entity in solver.entities:
+            if not entity.material.use_visual_raycasting:
+                continue
+            for vgeom in entity.vgeoms:
+                vgeom_enabled[vgeom.idx] = True
+        vface_vgeom_idx = qd_to_numpy(solver.vfaces_info.vgeom_idx)
+        return vgeom_enabled[vface_vgeom_idx].astype(np.int8)
+
+    def activate(self):
+        """
+        Build the per-(solver, mesh-type) BVHs on first activation; idempotent. Rigid solvers get a collision BVH
+        covering all collision faces; any solver with entities opting in via ``material.use_visual_raycasting`` gets a
+        visual BVH masked to those vfaces. Collision and visual entries coexist (the cast kernels merge in place).
+        """
+        if self._active:
+            return
+        self._active = True
+        for solver in (self._sim.rigid_solver, self._sim.kinematic_solver):
+            if not solver.is_active:
+                continue
+            n_envs = solver._B
+            # A solver's geometry is static when no link can be moved by the physics (all links fixed); it then changes
+            # only through an explicit set_pos/set_quat/set_vverts, all GEOMETRY mutations the subscription catches.
+            # Applies to both the collision and the visual BVH.
+            maybe_static = all(link.is_fixed for link in solver.links)
+            if isinstance(solver, RigidSolver):
+                n_faces = solver.faces_info.geom_idx.shape[0]
+                aabb = AABB(n_batches=n_envs, n_aabbs=n_faces)
+                bvh = LBVH(aabb, max_n_query_result_per_aabb=0, n_radix_sort_groups=64)
+                self._bvh_contexts.append(BVHContext(solver, bvh, aabb, None, maybe_static))
+            n_vfaces = solver.vfaces_info.vgeom_idx.shape[0]
+            if n_vfaces > 0:
+                mask = self._compute_visual_raycast_mask(solver)
+                if mask.any():
+                    aabb = AABB(n_batches=n_envs, n_aabbs=n_vfaces)
+                    bvh = LBVH(aabb, max_n_query_result_per_aabb=0, n_radix_sort_groups=64)
+                    self._bvh_contexts.append(BVHContext(solver, bvh, aabb, mask, maybe_static))
+
+        # Lazily watch each static BVH (collision or visual) for GEOMETRY changes. ``update`` polls its
+        # rebuild_subscriber so an explicit set_pos / set_quat / set_vverts on the otherwise-immovable geometry forces
+        # the (normally skipped) rebuild before the next cast.
+        for entry in self._bvh_contexts:
+            if entry.maybe_static:
+                entry.rebuild_subscriber = Subscriber(to=frozenset({StateChange.GEOMETRY}))
+                entry.solver.subscribe(entry.rebuild_subscriber)
+
+        self.update()
+
+    def update(self):
+        """Rebuild every BVH whose geometry may have changed since the last cast.
+
+        A static entry (maybe_static: no link the physics can move) is skipped while it is not flagged for rebuild,
+        since its tree would come out unchanged. Its rebuild_subscriber flags it after an explicit
+        set_pos/set_quat/set_vverts, and ``reset`` flags every entry, so a re-randomized terrain or teleported obstacle
+        still rebuilds. Movable entries are never static, so they rebuild on every call.
+        """
+        if not self._active:
+            return
+        for entry in self._bvh_contexts:
+            # A pending GEOMETRY change means a set_pos/set_quat/set_vverts hit this otherwise-static geometry since the
+            # last build; flag it for rebuild and clear the subscriber so the next idle update skips again.
+            if entry.rebuild_subscriber is not None and entry.rebuild_subscriber.pending:
+                entry.rebuild_subscriber.clear()
+                entry.needs_rebuild = True
+            if entry.maybe_static and not entry.needs_rebuild:
+                continue
+            if entry.raycast_mask is None:
+                kernel_update_verts_and_aabbs(
+                    geoms_info=entry.solver.geoms_info,
+                    geoms_state=entry.solver.geoms_state,
+                    verts_info=entry.solver.verts_info,
+                    faces_info=entry.solver.faces_info,
+                    free_verts_state=entry.solver.free_verts_state,
+                    fixed_verts_state=entry.solver.fixed_verts_state,
+                    links_info=entry.solver.links_info,
+                    static_rigid_sim_config=entry.solver._static_rigid_sim_config,
+                    aabb_state=entry.aabb,
+                )
+                entry.bvh.build()
+            else:
+                # Reads vverts_state.pos as the source of vvert positions. The buffer is seeded by FK at scene.build()
+                # and refreshed for each user-driven entity via set_vverts; entries set via set_vverts survive across
+                # calls until set_vverts(None) re-runs FK over the entity's vgeoms. raycast_mask gates which vfaces
+                # contribute to the BVH; masked-out vfaces keep an inverted AABB and are skipped by ray queries.
+                entry.solver.update_forward_pos()
+                entry.solver.update_vgeoms()
+                kernel_update_visual_aabbs(
+                    vverts_info=entry.solver.vverts_info,
+                    vverts_state=entry.solver.vverts_state,
+                    vfaces_info=entry.solver.vfaces_info,
+                    vgeoms_state=entry.solver.vgeoms_state,
+                    face_mask=entry.raycast_mask,
+                    aabb_state=entry.aabb,
+                )
+                entry.bvh.build()
+            entry.needs_rebuild = False
+            # The per-env trees are bit-identical - so the cast can read one shared copy (batch 0) - exactly when the
+            # per-face AABBs they are built from match across envs. Comparing that build input directly (rather than a
+            # proxy like link poses or raw verts) captures per-env pose, batched verts, and any per-env geometry
+            # selection at once - so it stays correct whatever feeds the AABBs. A single-env solver gains nothing.
+            if entry.maybe_static and entry.aabb.n_batches > 1:
+                aabb_min = qd_to_torch(entry.aabb.aabbs.min)
+                aabb_max = qd_to_torch(entry.aabb.aabbs.max)
+                entry.shared_across_envs = bool(
+                    torch.equal(aabb_min, aabb_min[:1].expand_as(aabb_min))
+                    and torch.equal(aabb_max, aabb_max[:1].expand_as(aabb_max))
+                )
+            else:
+                entry.shared_across_envs = False
+
+    def reset(self, envs_idx):
+        # A reset may change otherwise-static geometry (re-randomized terrain, teleported obstacles), so force every
+        # entry to rebuild once; static entries resume skipping on subsequent steps. The BVHs are geometry-global, not
+        # per-env, so ``envs_idx`` is unused. No-op when inactive (``_bvh_contexts`` is empty).
+        for entry in self._bvh_contexts:
+            entry.needs_rebuild = True
+        self.update()
+
+    def destroy(self):
+        self._bvh_contexts.clear()
+
+
+@dataclass
+class RaycasterSharedMetadata(KinematicSensorMetadataMixin, SimpleSensorMetadata):
+    # The BVHs cast against each frame live on the shared ``RaycastContext`` (one per active solver per mesh type),
+    # so a Raycaster and a DepthCamera share one set of trees. The first cast entry initializes the output cache
+    # (is_merge=False), the rest merge in closer hits. Per-sensor link poses are gathered via
+    # KinematicSensorMetadataMixin.solver_groups, independent of which BVH is being cast.
+
+    # Per-step scratch tensors for sensor link poses, lazily allocated on the first cast (B and n_sensors known).
+    links_pos: torch.Tensor | None = None
+    links_quat: torch.Tensor | None = None
+
+    sensors_ray_start_idx: list[int] = field(default_factory=list)
+    total_n_rays: int = 0
+
+    min_ranges: torch.Tensor = make_tensor_field((0,))
+    max_ranges: torch.Tensor = make_tensor_field((0,))
+    no_hit_values: torch.Tensor = make_tensor_field((0,))
+    return_world_frame: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_bool)
+
+    patterns: list[RaycastPattern] = field(default_factory=list)
+    ray_dirs: torch.Tensor = make_tensor_field((0, 3))
+    ray_starts: torch.Tensor = make_tensor_field((0, 3))
+    ray_starts_world: torch.Tensor = make_tensor_field((0, 3))
+    ray_dirs_world: torch.Tensor = make_tensor_field((0, 3))
+
+    points_to_sensor_idx: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
+    sensor_cache_offsets: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
+    sensor_point_offsets: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
+    sensor_point_counts: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
+
+
+class RaycasterReturnType(NamedTuple):
+    points: torch.Tensor
+    distances: torch.Tensor
+
+
+class RaycasterSensor(
+    KinematicSensorMixin,
+    SimpleSensor[RaycasterOptions, RaycastContext, RaycasterSharedMetadata, RaycasterReturnType],
+):
+    def __init__(
+        self,
+        options: RaycasterOptions,
+        idx: int,
+        shared_context,
+        shared_metadata,
+        manager: "SensorManager",
+    ):
+        super().__init__(options, idx, shared_context, shared_metadata, manager)
+        self.debug_objects: list["Mesh"] = []
+        self.ray_starts: torch.Tensor = torch.empty((0, 3), device=gs.device, dtype=gs.tc_float)
+
+    def build(self):
+        super().build()
+
+        # A raycaster always casts, so activate the shared ``RaycastContext`` now: the first consumer's activation
+        # builds the BVHs. Every raycaster then validates there is geometry to cast against.
+        self._shared_context.activate()
+        # The first raycaster seeds the leading boundary (0) of the per-sensor offsets into the shared cache tensor.
+        if self._idx == 0:
+            self._shared_metadata.sensor_cache_offsets = concat_with_tensor(
+                self._shared_metadata.sensor_cache_offsets, 0
+            )
+        if not self._shared_context.bvh_contexts:
+            gs.raise_exception(
+                "Raycaster sensor has no geometry to raycast against: rigid_solver is inactive and no entity "
+                "has material.use_visual_raycasting=True."
+            )
+
+        self._shared_metadata.patterns.append(self._options.pattern)
+
+        ray_starts = self._options.pattern.ray_starts.reshape(-1, 3)
+        self.ray_starts = transform_by_trans_quat(
+            ray_starts, self._shared_metadata.offsets_pos[0, -1, :], self._shared_metadata.offsets_quat[0, -1, :]
+        )
+        self._shared_metadata.ray_starts = torch.cat([self._shared_metadata.ray_starts, self.ray_starts])
+
+        ray_dirs = self._options.pattern.ray_dirs.reshape(-1, 3)
+        ray_dirs = transform_by_quat(ray_dirs, self._shared_metadata.offsets_quat[0, -1, :])
+        self._shared_metadata.ray_dirs = torch.cat([self._shared_metadata.ray_dirs, ray_dirs])
+
+        num_rays = math.prod(self._options.pattern.return_shape)
+        self._shared_metadata.sensors_ray_start_idx.append(self._shared_metadata.total_n_rays)
+
+        # These fields are used to properly index into the big cache tensor in kernel_cast_rays
+        self._shared_metadata.sensor_cache_offsets = concat_with_tensor(
+            self._shared_metadata.sensor_cache_offsets, self._cache_size * (self._idx + 1)
+        )
+        self._shared_metadata.sensor_point_offsets = concat_with_tensor(
+            self._shared_metadata.sensor_point_offsets, self._shared_metadata.total_n_rays
+        )
+        self._shared_metadata.sensor_point_counts = concat_with_tensor(
+            self._shared_metadata.sensor_point_counts, num_rays
+        )
+        self._shared_metadata.total_n_rays += num_rays
+
+        self._shared_metadata.points_to_sensor_idx = concat_with_tensor(
+            self._shared_metadata.points_to_sensor_idx, [self._idx] * num_rays, flatten=True
+        )
+        self._shared_metadata.return_world_frame = concat_with_tensor(
+            self._shared_metadata.return_world_frame, self._options.return_world_frame
+        )
+        self._shared_metadata.min_ranges = concat_with_tensor(self._shared_metadata.min_ranges, self._options.min_range)
+        self._shared_metadata.max_ranges = concat_with_tensor(self._shared_metadata.max_ranges, self._options.max_range)
+        self._shared_metadata.no_hit_values = concat_with_tensor(
+            self._shared_metadata.no_hit_values, self._options.no_hit_value
+        )
+
+        # Multi-BVH merge passes use raw distance comparison to pick the closer hit; this only works if no_hit_value >=
+        # max_range. The negated form also rejects NaN (every IEEE 754 comparison with NaN is False).
+        if len(self._shared_context.bvh_contexts) > 1 and not (self._options.no_hit_value >= self._options.max_range):
+            gs.raise_exception(
+                f"no_hit_value ({self._options.no_hit_value}) must be >= max_range ({self._options.max_range}) "
+                f"when multiple BVHs are active (the merge step compares raw distances)."
+            )
+
+    def _get_return_format(self) -> tuple[tuple[int, ...], ...]:
+        shape = self._options.pattern.return_shape
+        return ((*shape, 3), shape)
+
+    @classmethod
+    def _get_cache_dtype(cls) -> torch.dtype:
+        return gs.tc_float
+
+    @classmethod
+    def _update_raw_data(
+        cls, shared_context: RaycastContext, shared_metadata: RaycasterSharedMetadata, raw_data_T: torch.Tensor
+    ):
+        # The BVHs were already refreshed once this step by SensorManager (``RaycastContext.update``); read them here.
+        bvh_contexts = shared_context.bvh_contexts
+
+        # Allocate the link-pose scratch buffers on first cast (B and n_sensors are known here). Identity quat is baked
+        # into the initial allocation so static sensors (entity_idx<0) leave their rows at identity, letting the cast
+        # kernel apply pos_offset / euler_offset in world frame.
+        if shared_metadata.links_pos is None:
+            B = bvh_contexts[0].solver._B
+            shared_metadata.links_pos = torch.zeros(
+                B, shared_metadata.n_sensors, 3, device=gs.device, dtype=gs.tc_float
+            )
+            shared_metadata.links_quat = torch.zeros(
+                B, shared_metadata.n_sensors, 4, device=gs.device, dtype=gs.tc_float
+            )
+            shared_metadata.links_quat[:, :, 0] = 1.0
+
+        # Gather link poses per sensor. Sensors are pre-bucketed into shared_metadata.solver_groups at build time so
+        # this loop issues one bulk get_links_pos / get_links_quat per solver with already-tensor-typed indices.
+        links_pos = shared_metadata.links_pos
+        links_quat = shared_metadata.links_quat
+        for group in shared_metadata.solver_groups:
+            pos = group.solver.get_links_pos(links_idx=group.links_idx)
+            quat = group.solver.get_links_quat(links_idx=group.links_idx)
+            if group.solver.n_envs == 0:
+                pos = pos[None]
+                quat = quat[None]
+            links_pos[:, group.sensor_cols, :] = pos
+            links_quat[:, group.sensor_cols, :] = quat
+
+        # First entry initializes the cache (is_merge=False, writes a hit or no_hit_value into every slot). Each
+        # subsequent entry merges in place (is_merge=True, writes only where it found a closer hit).
+        for i, entry in enumerate(bvh_contexts):
+            solver = entry.solver
+            args_common = (
+                entry.bvh.nodes,
+                entry.bvh.morton_codes,
+                links_pos,
+                links_quat,
+                shared_metadata.ray_starts,
+                shared_metadata.ray_dirs,
+                shared_metadata.max_ranges,
+                shared_metadata.no_hit_values,
+                shared_metadata.return_world_frame,
+                shared_metadata.points_to_sensor_idx,
+                shared_metadata.sensor_cache_offsets,
+                shared_metadata.sensor_point_offsets,
+                shared_metadata.sensor_point_counts,
+                raw_data_T,
+                gs.EPS,
+                i > 0,
+                entry.shared_across_envs,
+            )
+            if entry.raycast_mask is None:
+                kernel_cast_rays(
+                    solver.fixed_verts_state,
+                    solver.free_verts_state,
+                    solver.verts_info,
+                    solver.faces_info,
+                    *args_common,
+                )
+            else:
+                kernel_cast_rays_visual(
+                    solver.vverts_info, solver.vverts_state, solver.vfaces_info, solver.vgeoms_state, *args_common
+                )
+
+    def _draw_debug(self, context: "RasterizerContext"):
+        """
+        Draw hit points as spheres in the scene.
+
+        Only draws for first rendered environment.
+        """
+        env_idx = context.rendered_envs_idx[0] if self._manager._sim.n_envs > 0 else None
+
+        data = self.read(env_idx)
+        points = data.points.reshape((-1, 3))
+
+        pos = self._link.get_pos(env_idx, relative=False)
+        quat = self._link.get_quat(env_idx, relative=False)
+        if pos.ndim == 2:
+            pos, quat = pos[0], quat[0]
+
+        ray_starts = transform_by_trans_quat(self.ray_starts, pos, quat)
+
+        if not self._options.return_world_frame:
+            points = transform_by_trans_quat(points + self.ray_starts, pos, quat)
+
+        for debug_object in self.debug_objects:
+            context.clear_debug_object(debug_object)
+        self.debug_objects.clear()
+
+        self.debug_objects += [
+            context.draw_debug_spheres(
+                ray_starts, radius=self._options.debug_sphere_radius, color=self._options.debug_ray_start_color
+            ),
+            context.draw_debug_spheres(
+                points, radius=self._options.debug_sphere_radius, color=self._options.debug_ray_hit_color
+            ),
+        ]

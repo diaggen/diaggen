@@ -2,7 +2,13 @@ outputs/
 .conda/
 .venv/
 venv/
-third_party/
+third_party/*
+!third_party/genesis-world/
+!third_party/genesis-world/**
+!third_party/sam3/
+!third_party/sam3/**
+!third_party/OmniPart/
+!third_party/OmniPart/**
 __pycache__/
 *.py[cod]
 .pytest_cache/

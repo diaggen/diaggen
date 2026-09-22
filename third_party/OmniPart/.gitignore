@@ -1,0 +1,14 @@
+__pycache__/
+.vscode/
+output/
+outputs
+ckpt/
+ckpt
+.DS_Store
+tmp/
+debug_images/
+__tracked_surface.stl
+PLAN*.md
+AGENTS.md
+.agents/
+.codex/

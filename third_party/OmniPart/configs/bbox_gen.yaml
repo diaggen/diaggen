@@ -1,0 +1,34 @@
+model:
+  name: bbox_gen
+  args:
+    encoder_dim_feat: 448
+    encoder_dim: 64
+    encoder_heads: 4
+    encoder_token_num: 2048
+    encoder_qkv_bias: false
+    encoder_use_ln_post: true
+    encoder_use_checkpoint: true
+    encoder_num_embed_freqs: 8
+    encoder_embed_include_pi: false
+    encoder_init_scale: 0.25
+    encoder_random_fps: true
+    encoder_learnable_query: true
+    encoder_layers: 8
+
+    max_group_size: 50
+
+    vocab_size: 67
+    decoder_hidden_size: 1024
+    decoder_num_hidden_layers: 24
+    decoder_ffn_dim: 4096
+    decoder_heads: 16
+    decoder_use_flash_attention: true
+    decoder_gradient_checkpointing: false
+
+    bins: 64
+    BOS_id: 64
+    EOS_id: 65
+    PAD_id: 66
+    max_length: 2187
+    voxel_token_length: 1886
+    voxel_token_placeholder: -1

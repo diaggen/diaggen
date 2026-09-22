@@ -30,12 +30,12 @@ namespace and wire-format identifiers are retained for dependency compatibility.
 ## Setup
 
 Dependencies and external integration requirements are listed only in
-`requirements.txt`. External model packages, checkpoints, environments, and
-simulator source are not bundled. Configure the external simulator checkout
-and environment in `configs/config_genesis_diagnostics_enabled.yaml`; relative
-paths there are resolved from the `configs/` directory. The Genesis badge shows
-the version of the companion simulator source used for this project; the
-checkout must also provide the live diagnostics API.
+`requirements.txt`. The project-specific Genesis, SAM3, and OmniPart source
+trees are bundled under `third_party/`; their Conda environments and required
+model checkpoint locations must be prepared locally. Configure the simulator
+checkout and environment in `configs/config_genesis_diagnostics_enabled.yaml`;
+relative paths there are resolved from the `configs/` directory. The bundled
+Genesis source provides the live diagnostics API used by this project.
 
 The runtime uses the existing environment names `hag4r`, `hag4r_mesh`,
 `hag4r_segmentation`, and `omnipart`, preferring matching prefixes under `.conda/`.

@@ -1,0 +1,2 @@
+git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
+git+https://github.com/autonomousvision/mip-splatting.git@dda02ab5ecf45d6edb8c540d9bb65c7e451345a9#subdirectory=submodules/diff-gaussian-rasterization
